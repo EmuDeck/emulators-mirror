@@ -25,7 +25,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: EmuDeck/EmuDeck
+          repository: dragoonDorise/EmuDeck
           ref: ${{ env.EMUDECK_REF }}
           path: emudeck
 
