@@ -22,12 +22,15 @@ DRY_RUN = "--dry-run" in sys.argv
 TARGETS = (("linux", "x86"), ("linux", "arm"), ("windows", "x86"))
 SOURCES = (
     (re.compile(r"^https://github\.com/([^/]+/[^/]+)/releases/download/[^/]+/([^/?#]+)$"), None),
+    (re.compile(r"^https://github\.com/([^/]+/[^/]+)/raw/.+/([^/?#]+)$"), None),
     (re.compile(r"^https://gitlab\.com/([^/]+/[^/]+)/-/package_files/\d+/download$"), None),
     (re.compile(r"^https://www\.richwhitehouse\.com/jaguar/builds/([^/?#]+)$"), "richwhitehouse/bigpemu"),
 )
+SKIP = re.compile(r"^https://github\.com/EmuDeck/|_libretro\.(dll|so|dylib)\.zip$", re.I)
 DOWNLOAD = re.compile(r"\.(zip|7z|appimage|exe|tar\.gz|tar\.xz|dll)$", re.I)
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) EmuDeck-mirror"
 KEEP_DAYS = 90
+NOT_MIRRORED = {"ryujinx_install"}
 INSTALL_TIMEOUT = 180
 PROBLEMS = []
 REAL_RUN = subprocess.run
@@ -47,9 +50,11 @@ def timeout(signum, frame):
 
 
 def source_of(url):
-    """Repo key and file name of a download EmuDeck can use from the mirror, or None if it is not mirrored."""
+    """Repo (or site) key and file name of an emulator download, or None if it is not mirrored. A None name is read from the server."""
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")) or SKIP.search(url):
+        return None
     for pattern, repo in SOURCES:
-        match = pattern.match(url) if isinstance(url, str) else None
+        match = pattern.match(url)
         if not match:
             continue
         if repo:
@@ -57,7 +62,9 @@ def source_of(url):
         if match.lastindex == 2:
             return match.group(1), urllib.parse.unquote(match.group(2))
         return match.group(1), None
-    return None
+    parsed = urllib.parse.urlparse(url)
+    last = urllib.parse.unquote(parsed.path.rstrip("/").split("/")[-1])
+    return parsed.netloc.lower(), last if "." in last else None
 
 
 def file_name(url):
@@ -122,7 +129,7 @@ def collect_urls():
     installs = sorted(name for name, fn in vars(emudeck).items()
                       if callable(fn) and name.endswith("_install")
                       and getattr(fn, "__module__", "").startswith("functions.emus_scripts"))
-    installs += ["srm_install", "esde_install"]
+    installs = [name for name in installs + ["srm_install", "esde_install"] if name not in NOT_MIRRORED]
 
     for system, cpu in TARGETS:
         for module in modules:
