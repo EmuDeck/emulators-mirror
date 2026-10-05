@@ -19,11 +19,40 @@ TOKEN = os.environ.get("GH_TOKEN", "")
 EMUDECK = Path(os.environ.get("EMUDECK_REPO", "emudeck")).resolve()
 DRY_RUN = "--dry-run" in sys.argv
 TARGETS = (("linux", "x86"), ("linux", "arm"), ("windows", "x86"))
-RELEASE_FILE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/releases/download/[^/]+/([^/?#]+)$")
+SOURCES = (
+    (re.compile(r"^https://github\.com/([^/]+/[^/]+)/releases/download/[^/]+/([^/?#]+)$"), None),
+    (re.compile(r"^https://gitlab\.com/([^/]+/[^/]+)/-/package_files/\d+/download$"), None),
+    (re.compile(r"^https://www\.richwhitehouse\.com/jaguar/builds/([^/?#]+)$"), "richwhitehouse/bigpemu"),
+)
+DOWNLOAD = re.compile(r"\.(zip|7z|appimage|exe|tar\.gz|tar\.xz|dll)$", re.I)
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) EmuDeck-mirror"
 KEEP_DAYS = 90
 REAL_RUN = subprocess.run
 REAL_POPEN = subprocess.Popen
 REAL_CHECK_OUTPUT = subprocess.check_output
+
+
+def source_of(url):
+    """Repo key and file name of a download EmuDeck can use from the mirror, or None if it is not mirrored."""
+    for pattern, repo in SOURCES:
+        match = pattern.match(url) if isinstance(url, str) else None
+        if not match:
+            continue
+        if repo:
+            return repo, urllib.parse.unquote(match.group(1))
+        if match.lastindex == 2:
+            return match.group(1), urllib.parse.unquote(match.group(2))
+        return match.group(1), None
+    return None
+
+
+def file_name(url):
+    """Real file name of a download whose URL does not include it (GitLab packages)."""
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        disposition = response.headers.get("Content-Disposition", "")
+    match = re.search(r'filename="?([^";]+)"?', disposition)
+    return match.group(1) if match else url.rstrip("/").split("/")[-1]
 
 
 def collect_urls():
@@ -45,21 +74,22 @@ def collect_urls():
     def record(*args, **kwargs):
         """Keeps the GitHub release URL among the arguments of a download EmuDeck tried and pretends it worked."""
         for value in (*args, *kwargs.values()):
-            match = RELEASE_FILE.match(value) if isinstance(value, str) else None
-            if match and match.group(1).lower() != MIRROR.lower():
+            source = source_of(value)
+            if source and source[0].lower() != MIRROR.lower():
                 found.add(value)
         return True
 
     real_get = requests.get
 
     def get(url, *args, **kwargs):
-        """Lets GitHub API searches through with the Action token and records any other download."""
-        if str(url).startswith("https://api.github.com/"):
-            if TOKEN:
-                kwargs["headers"] = {**(kwargs.get("headers") or {}), "Authorization": f"Bearer {TOKEN}"}
-            return real_get(url, *args, **kwargs)
-        record(str(url))
-        raise requests.RequestException("download skipped by the mirror")
+        """Lets searches (APIs, download pages, release JSONs) through and records file downloads instead of doing them."""
+        url = str(url)
+        if kwargs.get("stream") or DOWNLOAD.search(urllib.parse.urlparse(url).path):
+            record(url)
+            raise requests.RequestException("download skipped by the mirror")
+        if url.startswith("https://api.github.com/") and TOKEN:
+            kwargs["headers"] = {**(kwargs.get("headers") or {}), "Authorization": f"Bearer {TOKEN}"}
+        return real_get(url, *args, **kwargs)
 
     requests.get = get
     subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 0, "", "")
@@ -75,7 +105,7 @@ def collect_urls():
     installs = sorted(name for name, fn in vars(emudeck).items()
                       if callable(fn) and name.endswith("_install")
                       and getattr(fn, "__module__", "").startswith("functions.emus_scripts"))
-    installs.append("srm_install")
+    installs += ["srm_install", "esde_install"]
 
     for system, cpu in TARGETS:
         for module in modules:
@@ -107,9 +137,12 @@ def asset_key(name):
     return re.sub(r"\d+", "#", name.lower())
 
 
-def mirror_file(repo, name):
-    """Name of the mirrored copy of a file inside the release."""
-    return re.sub(r"[^A-Za-z0-9._-]", ".", f"{repo.replace('/', '__')}__{name}")
+def mirror_file(repo, name, taken):
+    """Name of the mirrored copy: the original file name, prefixed with its repo only if another repo already uses it."""
+    file = re.sub(r"[^A-Za-z0-9._+-]", ".", name)
+    if taken.get(file.lower(), repo.lower()) != repo.lower():
+        file = re.sub(r"[^A-Za-z0-9._+-]", ".", f"{repo.replace('/', '__')}__{name}")
+    return file
 
 
 def load_index():
@@ -139,7 +172,7 @@ def upload(source, file):
     folder = Path(tempfile.mkdtemp())
     path = folder / file
     try:
-        request = urllib.request.Request(source, headers={"User-Agent": "EmuDeck-mirror"})
+        request = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=600) as response, open(path, "wb") as out:
             shutil.copyfileobj(response, out)
         gh("release", "upload", TAG, str(path), "--clobber")
@@ -167,14 +200,21 @@ def main():
     print("Asking EmuDeck what it downloads...")
     wanted = {}
     for url in collect_urls():
-        repo, name = RELEASE_FILE.match(url).groups()
-        name = urllib.parse.unquote(name)
+        repo, name = source_of(url)
+        if name is None:
+            try:
+                name = file_name(url)
+            except (urllib.error.URLError, OSError) as error:
+                print(f"  ! {url}: {error}")
+                continue
         wanted.setdefault(repo, {})[asset_key(name)] = {"name": name, "source": url}
 
     ensure_release()
     index = load_index()
     index.setdefault("repos", {})
     today = datetime.date.today()
+    taken = {asset["file"].lower(): entry["repo"].lower()
+             for entry in index["repos"].values() for asset in entry["assets"]}
 
     for repo in sorted(set(wanted) | {entry["repo"] for entry in index["repos"].values()}, key=str.lower):
         print(repo)
@@ -188,17 +228,19 @@ def main():
                 delete(asset["file"])
         for key, asset in new.items():
             previous = old.get(key)
-            if previous and previous["source"] == asset["source"]:
+            file = mirror_file(repo, asset["name"], taken)
+            if previous and previous["source"] == asset["source"] and previous["file"] == file:
                 merged[key] = {**previous, "seen": today.isoformat()}
                 continue
-            file = mirror_file(repo, asset["name"])
             try:
                 upload(asset["source"], file)
             except (urllib.error.URLError, subprocess.CalledProcessError, OSError) as error:
                 print(f"  ! {asset['name']}: {error}")
                 continue
+            taken[file.lower()] = repo.lower()
             if previous and previous["file"] != file:
                 delete(previous["file"])
+                taken.pop(previous["file"].lower(), None)
             merged[key] = {**asset, "key": key, "file": file, "seen": today.isoformat(),
                            "url": f"https://github.com/{MIRROR}/releases/download/{TAG}/{file}"}
         if merged:
