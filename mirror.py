@@ -22,6 +22,8 @@ TARGETS = (("linux", "x86"), ("linux", "arm"), ("windows", "x86"))
 RELEASE_FILE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/releases/download/[^/]+/([^/?#]+)$")
 KEEP_DAYS = 90
 REAL_RUN = subprocess.run
+REAL_POPEN = subprocess.Popen
+REAL_CHECK_OUTPUT = subprocess.check_output
 
 
 def collect_urls():
@@ -89,6 +91,8 @@ def collect_urls():
 
     requests.get = real_get
     subprocess.run = REAL_RUN
+    subprocess.Popen = REAL_POPEN
+    subprocess.check_output = REAL_CHECK_OUTPUT
     return sorted(found)
 
 
