@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,9 +28,22 @@ SOURCES = (
 DOWNLOAD = re.compile(r"\.(zip|7z|appimage|exe|tar\.gz|tar\.xz|dll)$", re.I)
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) EmuDeck-mirror"
 KEEP_DAYS = 90
+INSTALL_TIMEOUT = 180
+PROBLEMS = []
 REAL_RUN = subprocess.run
 REAL_POPEN = subprocess.Popen
 REAL_CHECK_OUTPUT = subprocess.check_output
+
+
+def problem(text):
+    """Logs something that failed so the run ends red, without stopping the rest of the mirror."""
+    print(f"  ! {text}")
+    PROBLEMS.append(text)
+
+
+def timeout(signum, frame):
+    """Stops an EmuDeck installer that takes longer than INSTALL_TIMEOUT."""
+    raise TimeoutError(f"took more than {INSTALL_TIMEOUT}s")
 
 
 def source_of(url):
@@ -71,6 +85,9 @@ def collect_urls():
 
     found = set()
 
+    class SkippedDownload(requests.RequestException):
+        """Raised instead of downloading, so EmuDeck handles it like a failed download."""
+
     def record(*args, **kwargs):
         """Keeps the GitHub release URL among the arguments of a download EmuDeck tried and pretends it worked."""
         for value in (*args, *kwargs.values()):
@@ -86,7 +103,7 @@ def collect_urls():
         url = str(url)
         if kwargs.get("stream") or DOWNLOAD.search(urllib.parse.urlparse(url).path):
             record(url)
-            raise requests.RequestException("download skipped by the mirror")
+            raise SkippedDownload("download skipped by the mirror")
         if url.startswith("https://api.github.com/") and TOKEN:
             kwargs["headers"] = {**(kwargs.get("headers") or {}), "Authorization": f"Bearer {TOKEN}"}
         return real_get(url, *args, **kwargs)
@@ -113,10 +130,18 @@ def collect_urls():
             module.__dict__["cpu_arch"] = cpu
         for name in installs:
             before = len(found)
+            signal.signal(signal.SIGALRM, timeout)
+            signal.alarm(INSTALL_TIMEOUT)
             try:
                 getattr(emudeck, name)()
-            except Exception as error:
-                print(f"  {system}/{cpu} {name}: {type(error).__name__}: {error}")
+            except KeyboardInterrupt:
+                raise
+            except SkippedDownload:
+                pass
+            except BaseException as error:
+                problem(f"{system}/{cpu} {name}: {type(error).__name__}: {error}")
+            finally:
+                signal.alarm(0)
             if len(found) > before:
                 print(f"  {system}/{cpu} {name}: {len(found) - before} file(s)")
 
@@ -161,7 +186,10 @@ def save_index(index):
         return
     path = Path(tempfile.gettempdir()) / INDEX
     path.write_text(json.dumps(index, indent=2, sort_keys=True), encoding="utf-8")
-    gh("release", "upload", TAG, str(path), "--clobber")
+    try:
+        gh("release", "upload", TAG, str(path), "--clobber")
+    except Exception as error:
+        problem(f"index.json: {error}")
 
 
 def upload(source, file):
@@ -183,8 +211,12 @@ def upload(source, file):
 def delete(file):
     """Removes a file from the mirror release."""
     print(f"  ✗ {file}")
-    if not DRY_RUN:
+    if DRY_RUN:
+        return
+    try:
         gh("release", "delete-asset", TAG, file, "--yes")
+    except Exception as error:
+        problem(f"could not delete {file}: {error}")
 
 
 def ensure_release():
@@ -204,8 +236,8 @@ def main():
         if name is None:
             try:
                 name = file_name(url)
-            except (urllib.error.URLError, OSError) as error:
-                print(f"  ! {url}: {error}")
+            except Exception as error:
+                problem(f"{url}: {error}")
                 continue
         wanted.setdefault(repo, {})[asset_key(name)] = {"name": name, "source": url}
 
@@ -219,6 +251,8 @@ def main():
     for repo in sorted(set(wanted) | {entry["repo"] for entry in index["repos"].values()}, key=str.lower):
         print(repo)
         new = wanted.get(repo, {})
+        if not new:
+            problem(f"{repo}: EmuDeck no longer downloads it, keeping the last good files")
         old = {asset["key"]: asset for asset in index["repos"].get(repo.lower(), {}).get("assets", [])}
         merged = {}
         for key, asset in old.items():
@@ -234,8 +268,8 @@ def main():
                 continue
             try:
                 upload(asset["source"], file)
-            except (urllib.error.URLError, subprocess.CalledProcessError, OSError) as error:
-                print(f"  ! {asset['name']}: {error}")
+            except Exception as error:
+                problem(f"{repo} {asset['name']}: {type(error).__name__}: {error}")
                 continue
             taken[file.lower()] = repo.lower()
             if previous and previous["file"] != file:
@@ -248,6 +282,12 @@ def main():
         else:
             index["repos"].pop(repo.lower(), None)
         save_index(index)
+
+    if PROBLEMS:
+        print(f"\n{len(PROBLEMS)} problem(s), the rest of the mirror was updated:")
+        for text in PROBLEMS:
+            print(f"  - {text}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
