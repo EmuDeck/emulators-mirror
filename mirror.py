@@ -42,11 +42,12 @@ def collect_urls():
 
     found = set()
 
-    def record(url, *args, **kwargs):
-        """Keeps a URL EmuDeck tried to download and pretends the download worked."""
-        match = RELEASE_FILE.match(url) if isinstance(url, str) else None
-        if match and match.group(1).lower() != MIRROR.lower():
-            found.add(url)
+    def record(*args, **kwargs):
+        """Keeps the GitHub release URL among the arguments of a download EmuDeck tried and pretends it worked."""
+        for value in (*args, *kwargs.values()):
+            match = RELEASE_FILE.match(value) if isinstance(value, str) else None
+            if match and match.group(1).lower() != MIRROR.lower():
+                found.add(value)
         return True
 
     real_get = requests.get
