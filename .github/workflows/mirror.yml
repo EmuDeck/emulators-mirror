@@ -16,7 +16,7 @@ concurrency:
 
 env:
   # EmuDeck branch whose Python installers decide what gets mirrored
-  EMUDECK_REF: dev-hybrid
+  EMUDECK_REF: dev
 
 jobs:
   mirror:
