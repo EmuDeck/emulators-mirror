@@ -252,15 +252,20 @@ def main():
     index = load_index()
     index.setdefault("repos", {})
     today = datetime.date.today()
-    taken = {asset["file"].lower(): entry["repo"].lower()
+    last_run = datetime.date.fromisoformat(index.get("updated", "1970-01-01")[:10])
+    taken ={asset["file"].lower(): entry["repo"].lower()
              for entry in index["repos"].values() for asset in entry["assets"]}
 
     for repo in sorted(set(wanted) | {entry["repo"] for entry in index["repos"].values()}, key=str.lower):
         print(repo)
         new = wanted.get(repo, {})
-        if not new:
-            problem(f"{repo}: EmuDeck no longer downloads it, keeping the last good files")
         old = {asset["key"]: asset for asset in index["repos"].get(repo.lower(), {}).get("assets", [])}
+        if not new:
+            last_seen = max((datetime.date.fromisoformat(a["seen"]) for a in old.values()), default=today)
+            if last_seen >= last_run:
+                problem(f"{repo}: EmuDeck no longer downloads it, keeping the last good files")
+            else:
+                print(f"  EmuDeck no longer downloads it since {last_seen}, keeping the last good files")
         merged = {}
         for key, asset in old.items():
             if key in new or (today - datetime.date.fromisoformat(asset["seen"])).days <= KEEP_DAYS:
